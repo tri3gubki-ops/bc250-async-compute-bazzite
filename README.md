@@ -119,8 +119,6 @@ Three patches against Mesa 26.2.1, all in `patches/`:
 - No kernel patches are applied. This was tested only on the OGC kernel that
   Bazzite ships (`7.2.0-ogc4.1`, `7.2.0-ogc6.1`). On other kernels follow the
   upstream project, which requires its kernel half.
-- FPS gain is not measured here. The compute queues are verified to work; the
-  performance claim is not this project's.
 - `VK_EXT_pageable_device_local_memory` needs `AMDGPU_GEM_OP_SET_PRIORITY` in
   the kernel. That op is absent from the Bazzite kernel, so the extension is
   advertised but does nothing — same as the stock driver. `test/gemop-probe.c`
