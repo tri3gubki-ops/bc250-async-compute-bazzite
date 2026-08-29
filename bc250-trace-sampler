@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Sample amdgpu per-client engine time and board sensors into a trace directory.
+
+Run detached from the caller's process group (see bc250-game-trace): Steam's
+`reaper` waits for every process in the group it launched, so a background
+sampler that shares that group deadlocks the game's exit.
+
+Stops when the watched pid disappears, when the sentinel file is removed, on
+SIGTERM, or after max-seconds -- so it can never outlive the run it belongs to.
+
+Written as one process on purpose: the shell version spawned grep/sed/cat per
+file descriptor and needed ~85 s for a single pass, which missed the game
+entirely.
+"""
+import os
+import signal
+import sys
+import time
+
+RESCAN_EVERY = 5.0      # seconds between full /proc walks (a scan fits well inside one tick)
+DEFAULT_MAX = 6 * 3600  # never sample longer than this
+
+running = True
+
+
+def stop(_sig=None, _frm=None):
+    global running
+    running = False
+
+
+def find_hwmon():
+    """Map the sensors we care about to their hwmon directories, once."""
+    out = {}
+    base = "/sys/class/hwmon"
+    try:
+        entries = os.listdir(base)
+    except OSError:
+        return out
+    for e in entries:
+        try:
+            with open(f"{base}/{e}/name") as f:
+                name = f.read().strip()
+        except OSError:
+            continue
+        if name == "amdgpu":
+            out["gpu"] = f"{base}/{e}"
+        elif name == "k10temp":
+            out["cpu"] = f"{base}/{e}"
+        elif name in ("nct6686", "nct6687"):
+            out["nct"] = f"{base}/{e}"
+    return out
+
+
+def read_int(path, default=0):
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return default
+
+
+def scan_all():
+    """Full walk: every pid, every fd, keep the ones that are amdgpu DRM fds."""
+    found = {}
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return found
+    for pid in pids:
+        d = f"/proc/{pid}/fdinfo"
+        try:
+            fds = os.listdir(d)
+        except OSError:
+            continue
+        for fd in fds:
+            path = f"{d}/{fd}"
+            try:
+                with open(path) as f:
+                    text = f.read()
+            except OSError:
+                continue
+            if "drm-driver" not in text or "amdgpu" not in text:
+                continue
+            info = parse(text)
+            if info is None:
+                continue
+            try:
+                with open(f"/proc/{pid}/comm") as f:
+                    comm = f.read().strip()
+            except OSError:
+                comm = "?"
+            # One process can hold several fds on the same DRM client; the
+            # client id is what identifies the actual GPU context.
+            found[(pid, info[0])] = (path, comm)
+    return found
+
+
+def parse(text):
+    """-> (client_id, gfx_ns, compute_ns) or None."""
+    client = gfx = comp = None
+    for line in text.split("\n"):
+        if line.startswith("drm-client-id:"):
+            client = line.split(":", 1)[1].strip()
+        elif line.startswith("drm-engine-gfx:"):
+            gfx = line.split(":", 1)[1].split()[0]
+        elif line.startswith("drm-engine-compute:"):
+            comp = line.split(":", 1)[1].split()[0]
+    if client is None:
+        return None
+    try:
+        return client, int(gfx) if gfx else 0, int(comp) if comp else 0
+    except ValueError:
+        return None
+
+
+def main():
+    if len(sys.argv) < 3:
+        sys.exit("usage: bc250-trace-sampler <trace-dir> <watch-pid> [max-seconds]")
+    d = sys.argv[1]
+    watch = int(sys.argv[2])
+    max_s = float(sys.argv[3]) if len(sys.argv) > 3 else DEFAULT_MAX
+    sentinel = os.path.join(d, "sampler.alive")
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    hw = find_hwmon()
+    gpu, cpu, nct = hw.get("gpu"), hw.get("cpu"), hw.get("nct")
+    started = time.time()
+    tracked = {}
+    last_rescan = 0.0
+
+    with open(os.path.join(d, "samples.tsv"), "w") as out:
+        out.write("time\tcomm\tpid\tclient\tgfx_ns\tcompute_ns\t"
+                  "gpu_mhz\tgpu_c\tgpu_mv\tapu_w\tcpu_c\tpwm\trpm\n")
+        out.flush()
+        while running:
+            now = time.time()
+            if now - started > max_s:
+                break
+            if not os.path.exists(sentinel):
+                break
+            if not os.path.isdir(f"/proc/{watch}"):
+                break
+
+            if now - last_rescan >= RESCAN_EVERY:
+                tracked = scan_all()
+                last_rescan = now
+
+            gpu_mhz = read_int(f"{gpu}/freq1_input") // 1_000_000 if gpu else 0
+            gpu_c = read_int(f"{gpu}/temp1_input") // 1000 if gpu else 0
+            gpu_mv = read_int(f"{gpu}/in0_input") if gpu else 0
+            apu_w = read_int(f"{gpu}/power1_average") // 1_000_000 if gpu else 0
+            cpu_c = read_int(f"{cpu}/temp1_input") // 1000 if cpu else 0
+            pwm = read_int(f"{nct}/pwm2") if nct else 0
+            rpm = read_int(f"{nct}/fan2_input") if nct else 0
+
+            stamp = int(now)
+            dead = []
+            for key, (path, comm) in tracked.items():
+                try:
+                    with open(path) as f:
+                        info = parse(f.read())
+                except OSError:
+                    dead.append(key)
+                    continue
+                if info is None:
+                    continue
+                _client, gfx_ns, comp_ns = info
+                out.write(f"{stamp}\t{comm}\t{key[0]}\t{key[1]}\t{gfx_ns}\t{comp_ns}\t"
+                          f"{gpu_mhz}\t{gpu_c}\t{gpu_mv}\t{apu_w}\t{cpu_c}\t{pwm}\t{rpm}\n")
+            for key in dead:
+                tracked.pop(key, None)
+            out.flush()
+            time.sleep(1.0)
+
+
+if __name__ == "__main__":
+    main()

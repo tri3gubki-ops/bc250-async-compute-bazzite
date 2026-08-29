@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# Run a game with the patched RADV and record whether async compute was really used.
+#
+# Steam launch options:   bc250-game-trace %command%
+#
+# The verdict does not rely on driver log messages. amdgpu publishes per-client
+# engine busy time in /proc/<pid>/fdinfo/*, including drm-engine-compute, which
+# only advances when work actually runs on the ACE rings. If that counter moves
+# for the game's own process, async compute was used.
+#
+# Two things here are deliberate, both learned the hard way:
+#
+#   * The sampler runs under setsid, in its own process group. Steam's `reaper`
+#     waits for every process in the group it launched, so a plain background
+#     child hangs the game's exit forever -- Steam keeps showing "Playing".
+#   * The game's output goes to a file by plain redirection, never through a
+#     process substitution. `cmd 2> >(tee ...)` leaves bash holding the pipe's
+#     write end, so tee never sees EOF, never exits, and deadlocks reaper the
+#     same way.
+set -uo pipefail
+
+PREFIX=/usr/local/lib/bc250-radv
+ICD64="$PREFIX/share/vulkan/icd.d/radeon_icd.x86_64.json"
+ICD32_SYSTEM=/usr/share/vulkan/icd.d/radeon_icd.i686.json
+TRACE_ROOT="${BC250_TRACE_DIR:-$HOME/.local/share/bc250-async-compute/traces}"
+
+if [ $# -eq 0 ]; then
+	cat <<USAGE
+bc250-game-trace <command...>
+
+Put this in a game's Steam launch options:
+
+    bc250-game-trace %command%
+
+Traces are written to $TRACE_ROOT/<timestamp>/
+Read the newest one with:  bc250-async-compute trace
+
+Environment knobs:
+  BC250_TRACE_DIR=<dir>   where to write traces
+  BC250_TRACE_VERBOSE=1   raise vkd3d/dxvk logging to info (slower, more detail)
+  BC250_TRACE_STOCK=1     run on the stock system driver instead (control run)
+USAGE
+	exit 2
+fi
+
+[ -f "$ICD64" ] || { echo "bc250-game-trace: payload missing at $PREFIX; run install.sh" >&2; exit 1; }
+
+STAMP=$(date +%Y%m%d-%H%M%S)
+DIR="$TRACE_ROOT/$STAMP"
+mkdir -p "$DIR" || { echo "bc250-game-trace: cannot create $DIR" >&2; exit 1; }
+ln -sfn "$DIR" "$TRACE_ROOT/latest"
+
+# ---- driver selection ------------------------------------------------------
+DRIVER_FILES="$ICD64"
+[ -f "$ICD32_SYSTEM" ] && DRIVER_FILES="$DRIVER_FILES:$ICD32_SYSTEM"
+if [ "${BC250_TRACE_STOCK:-0}" = 1 ]; then
+	MODE="stock system driver (control run)"
+	unset VK_DRIVER_FILES VK_ICD_FILENAMES
+else
+	MODE="patched RADV (async compute)"
+	export VK_DRIVER_FILES="$DRIVER_FILES"
+	export VK_ICD_FILENAMES="$DRIVER_FILES"   # older loaders still read this
+	export BC250_IP_DEBUG=1                   # proves which driver got loaded
+fi
+
+# Proton writes its own log, which is where a Proton game's real output ends up
+# (our own redirection only catches the outer wrapper's). Point it at the trace.
+export PROTON_LOG=1
+export PROTON_LOG_DIR="$DIR"
+if [ "${BC250_TRACE_VERBOSE:-0}" = 1 ]; then
+	export VKD3D_DEBUG=info DXVK_LOG_LEVEL=info
+else
+	export VKD3D_DEBUG=warn DXVK_LOG_LEVEL=warn
+fi
+export DXVK_LOG_PATH="$DIR"
+
+# ---- static context --------------------------------------------------------
+# Capture, then take the first line: `rpm ... | head -1` under pipefail races.
+mesa_ver=$(rpm -q --qf '%{version}-%{release}\n' mesa-vulkan-drivers 2>/dev/null || true)
+mesa_ver=${mesa_ver%%$'\n'*}
+: "${mesa_ver:=unknown}"
+
+{
+	echo "started      : $(date -Is)"
+	echo "mode         : $MODE"
+	echo "command      : $*"
+	echo "kernel       : $(uname -r)"
+	echo "package      : $(cat /usr/local/share/bc250-async-compute/VERSION 2>/dev/null || echo unknown)"
+	echo "system Mesa  : $mesa_ver"
+	echo "VK_DRIVER_FILES=${VK_DRIVER_FILES:-<unset: stock>}"
+	echo "cpu threads  : $(nproc)"
+} >"$DIR/context.txt"
+
+# Remember where the journal is now, so the summary quotes only this session.
+journalctl -k -n0 --show-cursor 2>/dev/null | sed -n 's/^-- cursor: //p' >"$DIR/journal.cursor" || true
+
+# ---- sampler, detached from Steam's process group --------------------------
+: >"$DIR/sampler.alive"
+# LD_PRELOAD is dropped for the sampler: Steam injects its 32-bit overlay, and
+# ld.so then floods sampler.log with harmless "wrong ELF class" complaints.
+setsid env -u LD_PRELOAD /usr/local/bin/bc250-trace-sampler "$DIR" "$$" </dev/null \
+	>"$DIR/sampler.log" 2>&1 &
+SAMPLER=$!
+
+stop_sampler() {
+	rm -f "$DIR/sampler.alive"          # the sampler polls for this
+	kill "$SAMPLER" 2>/dev/null || true # and take the direct route too
+	local i
+	for i in 1 2 3 4 5; do
+		kill -0 "$SAMPLER" 2>/dev/null || break
+		sleep 0.4
+	done
+	kill -9 "$SAMPLER" 2>/dev/null || true
+}
+trap 'stop_sampler' EXIT INT TERM
+
+# ---- run the game ----------------------------------------------------------
+START=$(date +%s)
+"$@" >>"$DIR/game.log" 2>&1
+RC=$?
+END=$(date +%s)
+stop_sampler
+trap - EXIT INT TERM
+
+# ---- kernel messages from this session only --------------------------------
+CURSOR=$(cat "$DIR/journal.cursor" 2>/dev/null)
+if [ -n "$CURSOR" ]; then
+	journalctl -k --after-cursor "$CURSOR" --no-pager 2>/dev/null >"$DIR/kernel.log" || true
+else
+	journalctl -k --since "@$START" --no-pager 2>/dev/null >"$DIR/kernel.log" || true
+fi
+
+# ---- summary ---------------------------------------------------------------
+/usr/local/bin/bc250-trace-report "$DIR" "$RC" "$((END - START))" >"$DIR/summary.txt" 2>&1
+cat "$DIR/summary.txt"
+exit $RC

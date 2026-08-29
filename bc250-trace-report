@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""Turn a bc250-game-trace directory into a verdict.
+
+The central question is whether the game actually ran work on the ACE rings.
+That is answered from amdgpu's own per-client counters in fdinfo, not from any
+driver log line: drm-engine-compute only advances when the compute rings retire
+work. Everything else here is context for reading that answer.
+"""
+import os
+import re
+import sys
+from collections import defaultdict
+
+# Processes that are part of the desktop rather than the game.
+DESKTOP = {"kwin_wayland", "plasmashell", "Xwayland", "gamescope", "xdg-desktop-por",
+           "kwin_x11", "sddm-greeter", "steamwebhelper"}
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit("usage: bc250-trace-report <trace-dir> [exit-code] [seconds]")
+    d = sys.argv[1]
+    rc = sys.argv[2] if len(sys.argv) > 2 else "?"
+    secs = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+
+    def read(name, default=""):
+        try:
+            with open(os.path.join(d, name), errors="replace") as f:
+                return f.read()
+        except OSError:
+            return default
+
+    out = []
+    out.append("=" * 70)
+    out.append("BC-250 game trace report")
+    out.append("=" * 70)
+    out.append(read("context.txt").rstrip())
+    out.append(f"exit code    : {rc}")
+    out.append(f"duration     : {secs // 60}m {secs % 60}s")
+    out.append("")
+
+    # ---- 1. which driver was loaded ---------------------------------------
+    # A Proton game's real output goes to the Proton log, not to the stderr our
+    # wrapper captures, so every log in the trace has to be considered.
+    logs = [read("game.log")]
+    try:
+        for name in sorted(os.listdir(d)):
+            if name.endswith(".log") and name not in ("game.log", "kernel.log", "sampler.log"):
+                logs.append(read(name))
+    except OSError:
+        pass
+    game_log = "\n".join(logs)
+
+    ip_lines = re.findall(r"BC250_IP_DEBUG: ip_type=(\d+).*?num_queues=(\d+)", game_log)
+    compute_queues = None
+    for ip_type, nq in ip_lines:
+        if ip_type == "1":
+            compute_queues = int(nq)
+    if compute_queues is None:
+        out.append("driver       : could NOT confirm the patched RADV was loaded")
+        out.append("               (no BC250_IP_DEBUG output -- stock driver, a control run,")
+        out.append("                or the game did not inherit the environment)")
+    else:
+        out.append(f"driver       : patched RADV confirmed loaded, "
+                   f"COMPUTE ip reports {compute_queues} queues")
+
+    # What the D3D12 layer made of it. Not proof that work ran, but it shows
+    # whether the compute path was set up at all.
+    fams = sorted(set(re.findall(r"queue family (\d+)", game_log)))
+    d3d12_queues = len(re.findall(r"d3d12_command_queue_init", game_log))
+    if fams:
+        out.append(f"vkd3d-proton : used Vulkan queue families {', '.join(fams)}")
+    if d3d12_queues:
+        out.append(f"               game created {d3d12_queues} D3D12 command queue(s)")
+    out.append("")
+
+    # ---- 2. did anything use the compute rings ---------------------------
+    first, last, seen_pids, preexisting = {}, {}, {}, set()
+    peak = defaultdict(int)
+    samples = read("samples.tsv").splitlines()
+    first_ts = None
+    for line in samples[1:]:
+        parts = line.split("\t")
+        if len(parts) < 13:
+            continue
+        ts, comm, pid, client, gfx, comp = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
+        try:
+            gfx, comp = int(gfx), int(comp)
+        except ValueError:
+            continue
+        key = (comm, client)
+        if first_ts is None:
+            first_ts = ts
+        if key not in first:
+            first[key] = (gfx, comp)
+            # A client already present in the very first sample carries history
+            # from before the trace, so only its delta is ours. One that appears
+            # later — the game we launched — started at zero, so its absolute
+            # counter is the whole story and the delta would undercount it.
+            if ts == first_ts:
+                preexisting.add(key)
+        last[key] = (gfx, comp)
+        seen_pids[key] = pid
+        for name, idx in (("gpu_mhz", 6), ("gpu_c", 7), ("apu_w", 9), ("cpu_c", 10), ("rpm", 12)):
+            try:
+                peak[name] = max(peak[name], int(parts[idx]))
+            except (ValueError, IndexError):
+                pass
+
+    def used(key):
+        if key in preexisting:
+            return last[key][0] - first[key][0], last[key][1] - first[key][1]
+        return last[key]
+
+    rows = []
+    for key in sorted(last, key=lambda k: used(k)[1], reverse=True):
+        comm, client = key
+        dg, dc = used(key)
+        if dg <= 0 and dc <= 0:
+            continue
+        rows.append((comm, seen_pids[key], client, dg, dc))
+
+    game_compute = sum(dc for comm, _p, _c, _dg, dc in rows if comm not in DESKTOP)
+    game_gfx = sum(dg for comm, _p, _c, dg, _dc in rows if comm not in DESKTOP)
+
+    out.append("GPU engine time used during the run (from amdgpu fdinfo):")
+    if not rows:
+        out.append("  nothing recorded -- the run was too short, or no client rendered")
+    else:
+        out.append(f"  {'process':<20} {'pid':>7} {'client':>7} {'gfx ms':>10} {'compute ms':>12}")
+        for comm, pid, client, dg, dc in rows[:12]:
+            tag = "  (desktop)" if comm in DESKTOP else ""
+            out.append(f"  {comm:<20} {pid:>7} {client:>7} {dg/1e6:>10.1f} {dc/1e6:>12.1f}{tag}")
+    out.append("")
+
+    # ---- 3. verdict -------------------------------------------------------
+    out.append("-" * 70)
+    if game_compute > 0:
+        share = 100.0 * game_compute / (game_compute + game_gfx) if (game_compute + game_gfx) else 0.0
+        out.append(f"ASYNC COMPUTE: YES -- the game ran {game_compute/1e6:.1f} ms on the compute")
+        out.append(f"               rings ({share:.1f}% of its total engine time).")
+    elif game_gfx > 0:
+        out.append("ASYNC COMPUTE: NO -- the game rendered but never touched the compute rings.")
+        out.append("               Either the title does not use async compute, or it did not")
+        out.append("               get the patched driver. Check the driver line above.")
+    else:
+        out.append("ASYNC COMPUTE: UNKNOWN -- no game process was seen using the GPU at all.")
+        out.append("               The run may have been too short, or the game never started.")
+    out.append("-" * 70)
+    out.append("")
+
+    # ---- 4. trouble -------------------------------------------------------
+    kern = read("kernel.log")
+    bad = [l for l in kern.splitlines()
+           if re.search(r"ring timeout|gpu hang|GPU reset|amdgpu.*reset|VM_L2|page fault|"
+                        r"GPU fault|soft recovery|IH ring|BTF", l, re.I)]
+    if bad:
+        out.append(f"KERNEL TROUBLE: {len(bad)} suspicious line(s):")
+        for l in bad[:15]:
+            out.append("  " + l.strip()[:150])
+    else:
+        out.append("kernel       : clean -- no ring timeout, hang, reset or fault")
+    out.append("")
+
+    # A blocklist of harmless Proton chatter is a losing game: every prefix
+    # emits the 32-bit overlay preload complaints, absent VR/OpenXR runtimes,
+    # Fossilize cache warnings, nvapi "no NVIDIA device", and more. So match on
+    # what would actually matter for this driver instead, and say how many
+    # lines were passed over.
+    SIGNAL = re.compile(
+        r"VK_ERROR|DEVICE_LOST|device lost|GPU hang|"
+        r"err:vkd3d|err:d3d12|err:dxgi|"
+        r"radv:.*(error|fail)|amdgpu.*(error|fail)|"
+        r"out of (device |host )?memory|"
+        r"vkQueueSubmit|failed to create (device|instance|queue)",
+        re.I)
+    lines = [l for l in game_log.splitlines() if "BC250_IP_DEBUG" not in l]
+    errs = [l for l in lines if SIGNAL.search(l)]
+    noisy = sum(1 for l in lines if re.search(r"\berr\b|error|warn|failed", l, re.I)) - len(errs)
+    tail = f" ({noisy} unrelated warning/error line(s) ignored)" if noisy > 0 else ""
+    if errs:
+        out.append(f"game log     : {len(errs)} line(s) that could matter{tail}:")
+        for l in errs[:8]:
+            out.append("  " + l.strip()[:150])
+    else:
+        out.append(f"game log     : nothing driver-related{tail}")
+    out.append("")
+
+    if peak:
+        out.append(f"peaks        : GPU {peak['gpu_mhz']} MHz, {peak['gpu_c']} C  |  "
+                   f"APU {peak['apu_w']} W  |  CPU {peak['cpu_c']} C  |  fan {peak['rpm']} RPM")
+    out.append(f"trace dir    : {d}")
+    print("\n".join(out))
+
+
+if __name__ == "__main__":
+    main()

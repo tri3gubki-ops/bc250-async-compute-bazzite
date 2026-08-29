@@ -1,0 +1,12 @@
+--- a/src/amd/common/ac_gpu_info.c
++++ b/src/amd/common/ac_gpu_info.c
+@@ -491,6 +491,9 @@
+        */
+       info->ip[ip_type].num_queues = util_bitcount(ip_info->available_rings);
+    }
++   if (debug_get_bool_option("BC250_IP_DEBUG", false))
++      fprintf(stderr, "BC250_IP_DEBUG: ip_type=%u available_rings=0x%x userq_mask=0x%x -> num_queues=%u\n",
++              ip_type, ip_info->available_rings, info->userq_ip_mask, info->ip[ip_type].num_queues);
+ 
+    /* Gfx6-8 don't set ip_discovery_version. */
+    if (ip_info->ip_discovery_version) {

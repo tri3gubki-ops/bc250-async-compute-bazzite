@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# BC-250 async compute helper.
+#
+# The patched RADV is deliberately NOT a system driver: its ICD lives outside
+# every directory the Vulkan loader scans, so nothing picks it up unless
+# VK_DRIVER_FILES points at it. This tool prints that value, checks the install,
+# and runs the verification tests.
+set -uo pipefail
+
+PREFIX=/usr/local/lib/bc250-radv
+ICD64="$PREFIX/share/vulkan/icd.d/radeon_icd.x86_64.json"
+ICD32_SYSTEM=/usr/share/vulkan/icd.d/radeon_icd.i686.json
+ICD64_SYSTEM=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json
+SHARE=/usr/local/share/bc250-async-compute
+# System-wide, so the patched driver is simply the driver: every graphical
+# session gets it from environment.d, and login shells from profile.d.
+ENV_CONF=/etc/environment.d/95-bc250-async-compute.conf
+PROFILE_CONF=/etc/profile.d/95-bc250-async-compute.sh
+# Left over from 0.1.0, which enabled this per user. Removed on enable.
+LEGACY_USER_CONF="$HOME/.config/environment.d/95-bc250-async-compute.conf"
+BC250_PCI="1002:13fe"
+
+if [ -t 1 ]; then
+	B=$'\033[1m'; R=$'\033[0m'; G=$'\033[32m'; Y=$'\033[33m'; E=$'\033[31m'; D=$'\033[2m'
+else
+	B=""; R=""; G=""; Y=""; E=""; D=""
+fi
+ok()   { printf '%s[ OK ]%s %s\n' "$G" "$R" "$*"; }
+warn() { printf '%s[WARN]%s %s\n' "$Y" "$R" "$*"; }
+bad()  { printf '%s[FAIL]%s %s\n' "$E" "$R" "$*"; }
+die()  { bad "$*"; exit 1; }
+
+LVP64_SYSTEM=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+
+# driver_files() with the stock 64-bit ICD instead of ours, so the two rows in
+# `status` differ by exactly one file.
+system_driver_files() {
+	local v="$ICD64_SYSTEM"
+	[ -f "$ICD32_SYSTEM" ] && v="$v:$ICD32_SYSTEM"
+	[ -f "$LVP64_SYSTEM" ] && v="$v:$LVP64_SYSTEM"
+	printf '%s' "$v"
+}
+
+driver_files() {
+	local v="$ICD64"
+	# The 32-bit half stays stock: Proton's 32-bit helpers and the Steam overlay
+	# need a working i686 ICD, and no 32-bit title uses async compute.
+	[ -f "$ICD32_SYSTEM" ] && v="$v:$ICD32_SYSTEM"
+	# Keep the software rasteriser in the list. VK_DRIVER_FILES replaces the
+	# loader's whole search, so without this line llvmpipe disappears from the
+	# system -- and it is the only Vulkan left if amdgpu ever fails to load.
+	# Nothing prefers it: it reports itself as a CPU device, which DXVK and
+	# VKD3D skip.
+	[ -f "$LVP64_SYSTEM" ] && v="$v:$LVP64_SYSTEM"
+	printf '%s' "$v"
+}
+
+# Capture before matching: under `set -o pipefail`, `cmd | grep -q` reports
+# failure whenever grep exits on its first match and the producer gets SIGPIPE.
+is_bc250() {
+	local pci
+	pci=$(lspci -nn 2>/dev/null || true)
+	printf '%s' "$pci" | grep -qi "\[$BC250_PCI\]"
+}
+
+# $1 = VK_DRIVER_FILES value, always required and always applied through `env`:
+# always-on exports VK_DRIVER_FILES system-wide, so an unprefixed vulkaninfo
+# would inherit it and measure the patched driver twice.
+queue_report() {
+	local out
+	out=$(env -u VK_ICD_FILENAMES "VK_DRIVER_FILES=$1" vulkaninfo 2>/dev/null | grep -E 'queueFlags' | sed 's/.*= //')
+	local compute_only=0 line
+	while IFS= read -r line; do
+		case "$line" in
+			*QUEUE_COMPUTE_BIT*)
+				case "$line" in *QUEUE_GRAPHICS_BIT*) ;; *) compute_only=$((compute_only + 1)) ;; esac
+				;;
+		esac
+	done <<<"$out"
+	printf '%d' "$compute_only"
+}
+
+cmd_status() {
+	printf '%sBC-250 async compute%s\n\n' "$B" "$R"
+	if is_bc250; then ok "board: AMD BC-250 ($BC250_PCI) detected"
+	else warn "board: BC-250 ($BC250_PCI) NOT detected -- this package is only for BC-250"; fi
+	printf '       kernel: %s\n' "$(uname -r)"
+	# rpm prints two lines (x86_64 + i686). Capture, then take the first --
+	# `rpm ... | head -1` under pipefail is a SIGPIPE race.
+	local mesa_ver
+	mesa_ver=$(rpm -q --qf '%{version}-%{release}\n' mesa-vulkan-drivers 2>/dev/null || true)
+	mesa_ver=${mesa_ver%%$'\n'*}
+	printf '       system Mesa: %s\n' "${mesa_ver:-unknown}"
+	[ -r "$SHARE/VERSION" ] && printf '       package: %s\n' "$(cat "$SHARE/VERSION")"
+
+	if [ -f "$PREFIX/lib64/libvulkan_radeon.so" ]; then
+		ok "payload: $PREFIX"
+	else
+		die "payload missing at $PREFIX -- run install.sh"
+	fi
+
+	local missing
+	missing=$(ldd "$PREFIX/lib64/libvulkan_radeon.so" 2>/dev/null | awk '/not found/{print $1}')
+	if [ -n "$missing" ]; then
+		bad "unresolved libraries: $(echo "$missing" | tr '\n' ' ')"
+	else
+		ok "all shared libraries resolve"
+	fi
+
+	local sys ours
+	sys=$(queue_report "$(system_driver_files)")
+	ours=$(queue_report "$(driver_files)")
+	printf '\n       dedicated compute (ACE) queue families:\n'
+	printf '         system driver : %s\n' "$sys"
+	printf '         this package  : %s\n' "$ours"
+	if [ "$ours" -gt 0 ]; then
+		ok "async compute is exposed by this package"
+	else
+		bad "no dedicated compute family even with this package"
+	fi
+
+	if [ "$(always_state)" = enabled ]; then
+		ok "always on: the patched driver is the system Vulkan driver"
+		printf '       (takes effect after a re-login; no launch options needed)\n'
+	else
+		warn "always-on is OFF -- async compute only in processes given VK_DRIVER_FILES"
+		printf '       turn it on: sudo bc250-async-compute always enable\n'
+	fi
+	if [ "$(always_state)" != enabled ]; then
+		printf '\n%sPer-process use, while always-on is off:%s\n  bc250-game-trace %%command%%\n' "$B" "$R"
+		printf '%s  %s%s\n' "$D" "$(cmd_steam_line)" "$R"
+	fi
+}
+
+cmd_env()   { printf 'VK_DRIVER_FILES=%s\n' "$(driver_files)"; }
+cmd_steam_line() { printf 'VK_DRIVER_FILES=%s %%command%%' "$(driver_files)"; }
+cmd_steam() {
+	if [ "$(always_state)" = enabled ]; then
+		printf '%sNothing to add.%s Async compute is on system-wide, so every game\n' "$G" "$R"
+		printf 'gets it with empty launch options.\n\n'
+		printf 'Optional, to record whether a game really used the compute queues:\n\n  bc250-game-trace %%command%%\n\n'
+		printf '%sAfterwards:  bc250-async-compute trace%s\n' "$D" "$R"
+		return 0
+	fi
+	printf '%sAlways-on is off, so a game needs launch options.%s\n\n' "$Y" "$R"
+	printf 'Recommended -- also records whether async compute was used:\n\n  bc250-game-trace %%command%%\n\n'
+	printf 'Plain:\n\n  %s\n\n' "$(cmd_steam_line)"
+	printf '%sOr turn it on for everything and forget launch options:\n  sudo bc250-async-compute always enable%s\n' "$B" "$R"
+}
+
+cmd_test() {
+	local bin="$SHARE/test/bc250-ace-test"
+	[ -x "$bin" ] || die "test binary missing; build it with: $SHARE/test/build.sh"
+	VK_DRIVER_FILES="$(driver_files)" "$bin"
+}
+
+cmd_soak() {
+	local bin="$SHARE/test/bc250-ace-soak"
+	[ -x "$bin" ] || die "soak binary missing; build it with: $SHARE/test/build.sh"
+	printf '%sThis runs sustained GPU work. Desktop responsiveness may dip.%s\n' "$Y" "$R"
+	VK_DRIVER_FILES="$(driver_files)" "$bin" "${1:-300}"
+}
+
+always_state() {
+	[ -f "$ENV_CONF" ] && printf 'enabled' || printf 'disabled'
+}
+
+cmd_always() {
+	case "${1:-status}" in
+	enable)
+		if [ "$(id -u)" != 0 ]; then
+			die "needs root: sudo bc250-async-compute always enable"
+		fi
+		install -d -m 755 "$(dirname "$ENV_CONF")" "$(dirname "$PROFILE_CONF")"
+		{
+			printf '# BC-250: the patched RADV is the Vulkan driver for every session.\n'
+			printf '# Remove this file, or run "bc250-async-compute always disable",\n'
+			printf '# to return to the stock driver. Applies after a re-login.\n'
+			printf 'VK_DRIVER_FILES=%s\n' "$(driver_files)"
+			printf 'VK_ICD_FILENAMES=%s\n' "$(driver_files)"
+		} >"$ENV_CONF"
+		chmod 644 "$ENV_CONF"
+		# environment.d only reaches the systemd user session; a login shell
+		# (a TTY, or ssh) reads profile.d instead. Both, so "always" is honest.
+		{
+			printf '# BC-250: patched RADV for login shells. See %s\n' "$ENV_CONF"
+			printf 'export VK_DRIVER_FILES=%s\n' "$(driver_files)"
+			printf 'export VK_ICD_FILENAMES=%s\n' "$(driver_files)"
+		} >"$PROFILE_CONF"
+		chmod 644 "$PROFILE_CONF"
+		[ -f "$LEGACY_USER_CONF" ] && rm -f "$LEGACY_USER_CONF" && \
+			warn "removed the old per-user override, the system-wide one replaces it"
+		command -v restorecon >/dev/null 2>&1 && restorecon -F "$ENV_CONF" "$PROFILE_CONF" 2>/dev/null
+		ok "async compute is now on for the whole system"
+		printf '\n%sLog out and back in to apply.%s No launch options needed after that.\n' "$B" "$R"
+		printf '%sIf the desktop does not come back: switch to a text console with\nCtrl+Alt+F3, log in, run "sudo rm %s", and reboot.%s\n' \
+			"$D" "$ENV_CONF" "$R"
+		;;
+	disable)
+		if [ "$(id -u)" != 0 ]; then
+			die "needs root: sudo bc250-async-compute always disable"
+		fi
+		rm -f "$ENV_CONF" "$PROFILE_CONF"
+		ok "back to the stock driver -- log out and back in to apply"
+		;;
+	status|*)
+		printf '%s\n' "$(always_state)"
+		[ -f "$ENV_CONF" ] && printf '  %s\n  %s\n' "$ENV_CONF" "$PROFILE_CONF"
+		;;
+	esac
+}
+
+cmd_trace() {
+	local root="${BC250_TRACE_DIR:-$HOME/.local/share/bc250-async-compute/traces}"
+	local dir="${1:-}"
+	if [ -z "$dir" ]; then
+		[ -e "$root/latest" ] || die "no traces yet -- add 'bc250-game-trace %command%' to the game's launch options and play"
+		dir=$(readlink -f "$root/latest")
+	fi
+	[ -d "$dir" ] || die "not a trace directory: $dir"
+	if [ -f "$dir/summary.txt" ]; then
+		cat "$dir/summary.txt"
+	else
+		# The game may still be running, or it was killed before the summary ran.
+		warn "no summary.txt yet (game still running, or it was killed) -- generating one now"
+		/usr/local/bin/bc250-trace-report "$dir" "?" 0
+	fi
+}
+
+cmd_traces() {
+	local root="${BC250_TRACE_DIR:-$HOME/.local/share/bc250-async-compute/traces}"
+	[ -d "$root" ] || die "no traces yet"
+	local d
+	for d in "$root"/*/; do
+		[ -d "$d" ] || continue
+		printf '%-24s %s\n' "$(basename "$d")" \
+			"$(grep -m1 -E '^ASYNC COMPUTE' "$d/summary.txt" 2>/dev/null || echo 'no summary')"
+	done
+}
+
+case "${1:-status}" in
+status)  cmd_status ;;
+trace)   shift; cmd_trace "${1:-}" ;;
+traces)  cmd_traces ;;
+env)     cmd_env ;;
+steam)   cmd_steam ;;
+test)    cmd_test ;;
+soak)    shift; cmd_soak "${1:-300}" ;;
+always)  shift; cmd_always "${1:-status}" ;;
+session) shift; cmd_always "${1:-status}" ;;   # 0.1.0 alias
+-h|--help|help)
+	cat <<USAGE
+bc250-async-compute <command>
+
+  status              board, payload, and whether an ACE queue family appears
+  steam               the Steam launch-options line to paste (recommended way)
+  trace [dir]         report on a traced game run (default: the newest one)
+  traces              list every traced run with its async-compute verdict
+  env                 just the VK_DRIVER_FILES value
+  test                functional test: meta transfers + dispatches on ACE queues
+  soak [seconds]      sustained correctness soak (default 300)
+  always enable       make the patched driver the system Vulkan driver (root)
+  always disable      go back to the stock driver
+  always status       is it on?
+USAGE
+	;;
+*) die "unknown command '$1' (try --help)" ;;
+esac

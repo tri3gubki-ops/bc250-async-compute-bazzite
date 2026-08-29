@@ -1,0 +1,8 @@
+payload/
+work/
+*.tar.zst
+*.tar.zst.sha256
+test/bc250-ace-test
+test/bc250-ace-soak
+test/gemop-probe
+*.o
