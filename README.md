@@ -98,6 +98,36 @@ sudo ./install.sh
 `--prefix` must stay `/usr/local/lib/bc250-radv`: Mesa bakes that path into
 the ICD manifest and the drirc directory at configure time.
 
+### Optional: faster signed integer dot products
+
+[dmorazasanchez/bc250-fsr4](https://github.com/dmorazasanchez/bc250-fsr4)
+optimises how RADV lowers signed packed 4x8 dot products on GFX1013. Upstream
+Mesa already refuses the native `v_dot4_i32_i8` on this chip
+(`has_accelerated_dot_product` excludes `CHIP_GFX1013`), so results are correct
+either way -- their patch makes the software path cheaper.
+
+Measured here with their own micro-benchmark, Mesa 26.2.1, this board:
+
+| Operation | Without | With | |
+|---|---|---|---|
+| signed | 665 Gdot/s | 713 Gdot/s | +7.2% |
+| unsigned | 666.54 | 666.57 | unchanged |
+| mixed | 665.22 | 664.90 | unchanged |
+
+`verify: PASS` on both.
+
+That project ships **no license**, so its patch is not vendored here. Fetch it
+yourself, before this repo's patches:
+
+```bash
+git clone --depth 1 -b v3 https://github.com/dmorazasanchez/bc250-fsr4 /tmp/fsr4
+# drop the one hunk already upstream in 26.2.1 (GFX1013 in the ver_minor list)
+grep -v -A9 '^@@ -504,7 +502,8 @@' /tmp/fsr4/bc250-fsr4-v3.patch > /tmp/fsr4-26.2.1.patch
+( cd "$W/src/mesa-26.2.1" && git apply /tmp/fsr4-26.2.1.patch )
+```
+
+Their patch already contains this repo's `0001`, so apply only `0003` after it.
+
 ## Requirements
 
 - AMD BC-250
@@ -113,6 +143,8 @@ Three patches against Mesa 26.2.1, all in `patches/`:
 | `0001` | exposes the dedicated compute (ACE) queue on GFX1013 and routes the chip through the existing Iceland/Tonga threadgroup workaround |
 | `0002` | optional queue-count debug output, `BC250_IP_DEBUG=1` |
 | `0003` | `VK_EXT_pageable_device_local_memory`, for parity with the Mesa that Bazzite ships |
+
+Optional and not vendored: the signed-dot lowering work above.
 
 ## Known limits
 
@@ -132,6 +164,8 @@ Three patches against Mesa 26.2.1, all in `patches/`:
 | Opening the ACE queue on GFX1013, threadgroup workaround | [DryhoppedIPA/bc250-gfx1013-fix](https://github.com/DryhoppedIPA/bc250-gfx1013-fix) |
 | `VK_EXT_pageable_device_local_memory` (`0003`) | Natalie Vock, via [OpenGamingCollective/mesa](https://github.com/OpenGamingCollective/mesa) |
 | RADV | [Mesa](https://gitlab.freedesktop.org/mesa/mesa), MIT |
+| Signed packed-dot lowering (optional, not vendored) | [dmorazasanchez/bc250-fsr4](https://github.com/dmorazasanchez/bc250-fsr4) |
+| INT8 dot micro-benchmark used for the numbers above | same project, originally PR #1 by `higorprado` |
 
 Not affiliated with AMD, Valve, Fyra Labs, the Open Gaming Collective or the
 Mesa project.
