@@ -15,6 +15,11 @@ the 0.2.4 release binary stays correct -- no new binary is published.
 - One hunk of their v3 patch is already upstream in Mesa 26.2.1: GFX1013 was
   added to the `ver_minor` fix-up list in `ac_gpu_info.c`. Drop it or the patch
   will not apply.
+- Kernel `7.2.1-ogc4.1` added to the tested list. The 0.2.4 payload runs on it
+  unchanged: 4 ACE queues enumerated, all five `bc250-async-compute test` cases
+  pass, shared libraries still resolve. Mesa moved 26.2.1-4 -> 26.2.1-5, a
+  Fedora rebuild of the same Mesa version, and the payload does not link the
+  system Mesa anyway.
 - Measured the effect on this board with their micro-benchmark: signed dot
   665 -> 713 Gdot/s (+7.2%), unsigned and mixed unchanged, `verify: PASS` on
   both builds. Correctness was never the issue -- upstream Mesa already
